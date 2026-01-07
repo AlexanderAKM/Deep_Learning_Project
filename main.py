@@ -1,6 +1,8 @@
 #%% Imports
 import os
 from dotenv import load_dotenv
+
+# You need to make your own .env file with your Kaggle API key to run this!
 load_dotenv()
 
 import torch
@@ -19,12 +21,18 @@ import cv2
 import kagglehub
 from pathlib import Path
 from collections import Counter
-import hashlib
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 #%% Dataset Download & Setup
+# Of course data inspection and similar things were done, 
+# but for clarity it's nice to just have one long interactive python notebook
+# where this kind of exploratory code is not present. 
+# The exploratory code was similar in nature as a notebook Alexander
+# wrote roughly two years ago: https://github.com/AlexanderAKM/Skin_Cancer_Detection/blob/main/skin_cancer_detection.ipynb
+# This python file is intended to be very clear. 
+
 CLASSES = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
 CLASS_NAMES = ['Actinic Keratosis', 'Basal Cell Carcinoma', 'Benign Keratosis', 
                'Dermatofibroma', 'Melanoma', 'Melanocytic Nevus', 'Vascular Lesion']
@@ -33,153 +41,18 @@ print("Downloading HAM10000 dataset via kagglehub...")
 DATA_DIR = Path(kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000"))
 print(f"Dataset path: {DATA_DIR}")
 
-# Use writable directory for segmented images (Kaggle cache is read-only on Colab)
-SEGMENTED_DIR = Path("./segmented_images")
-
-#%% U-Net Architecture for Segmentation (Paper: "Hybrid U-Net and Improved MobileNet-V3")
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x):
-        return self.conv(x)
-
-class UNet(nn.Module):
-    # COMMENT: Paper doesn't specify U-Net architecture details. Using standard U-Net.
-    # IMPROVEMENT: Could use attention U-Net or U-Net++ for better segmentation.
-    def __init__(self, in_channels=3, out_channels=1):
-        super().__init__()
-        self.enc1 = DoubleConv(in_channels, 64)
-        self.enc2 = DoubleConv(64, 128)
-        self.enc3 = DoubleConv(128, 256)
-        self.enc4 = DoubleConv(256, 512)
-        self.pool = nn.MaxPool2d(2)
-        self.bottleneck = DoubleConv(512, 1024)
-        self.up4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
-        self.dec4 = DoubleConv(1024, 512)
-        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.dec3 = DoubleConv(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec2 = DoubleConv(256, 128)
-        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec1 = DoubleConv(128, 64)
-        self.out_conv = nn.Conv2d(64, out_channels, 1)
-    
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.pool(e3))
-        b = self.bottleneck(self.pool(e4))
-        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return torch.sigmoid(self.out_conv(d1))
-
-#%% Simple Lesion Segmentation (fallback when U-Net not trained)
-def segment_lesion_simple(image_np):
-    # COMMENT: Paper uses trained U-Net but doesn't provide weights.
-    # This is a simple color-based segmentation as fallback.
-    # IMPROVEMENT: Train U-Net on ISIC segmentation masks if available.
-    hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
-    lower = np.array([0, 20, 20])
-    upper = np.array([180, 255, 200])
-    mask = cv2.inRange(hsv, lower, upper)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        mask = np.zeros_like(mask)
-        cv2.drawContours(mask, [largest], -1, 255, -1)
-    return mask
-
-def apply_segmentation_mask(image, mask):
-    # COMMENT: Paper doesn't specify how mask is applied. Using bounding box crop.
-    # IMPROVEMENT: Could use mask to remove background completely.
-    coords = np.where(mask > 0)
-    if len(coords[0]) > 0:
-        y_min, y_max = coords[0].min(), coords[0].max()
-        x_min, x_max = coords[1].min(), coords[1].max()
-        pad = 10
-        y_min, y_max = max(0, y_min - pad), min(image.shape[0], y_max + pad)
-        x_min, x_max = max(0, x_min - pad), min(image.shape[1], x_max + pad)
-        cropped = image[y_min:y_max, x_min:x_max]
-        return cropped
-    return image
-
-#%% Pre-compute Segmented Images (runs once, saves to disk)
-def precompute_segmentation(image_paths):
-    """Pre-compute segmentation for all images. Only runs if not already done."""
-    SEGMENTED_DIR.mkdir(exist_ok=True)
-    
-    # Check if already done
-    done_marker = SEGMENTED_DIR / ".done"
-    if done_marker.exists():
-        print("Segmented images already exist, skipping preprocessing...")
-        return
-    
-    print("Pre-computing segmentation for all images (one-time operation)...")
-    for img_path in tqdm(image_paths, desc="Segmenting"):
-        img_path = Path(img_path)
-        out_path = SEGMENTED_DIR / img_path.name
-        
-        if out_path.exists():
-            continue
-            
-        img = Image.open(img_path).convert('RGB')
-        img_np = np.array(img)
-        mask = segment_lesion_simple(img_np)
-        segmented = apply_segmentation_mask(img_np, mask)
-        
-        # Resize to 224x224 during preprocessing to save even more time
-        segmented_img = Image.fromarray(segmented)
-        segmented_img = segmented_img.resize((224, 224), Image.LANCZOS)
-        segmented_img.save(out_path, quality=95)
-    
-    # Mark as done
-    done_marker.touch()
-    print("Segmentation preprocessing complete!")
-
-#%% Transforms - EXACTLY as specified in paper Table 4
+#%% Transforms - as specified in paper Table 4
 def get_transforms(phase):
-    # Paper Table 4 specifies these EXACT values:
-    # - Rotation: 25 degrees
-    # - Width/Height Shift: 15%
-    # - Shearing: 15%
-    # - Horizontal Flip: Yes
-    # - Vertical Flip: Yes  
-    # - Brightness: [0.9, 1.5]
-    # - Zoom: 0.4
-    # - Input size: 224x224
-    # - Normalization: [0, 1]
-    
     if phase == 'train':
         return transforms.Compose([
-            transforms.Resize((224, 224)),  # Paper: 224x224
-            transforms.RandomRotation(25),  # Paper: 25 degrees
-            transforms.RandomAffine(
-                degrees=0, 
-                translate=(0.15, 0.15),  # Paper: 15% width/height shift
-                shear=15  # Paper: 15% shearing
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),  # Paper: horizontal flip
-            transforms.RandomVerticalFlip(p=0.5),  # Paper: vertical flip
-            transforms.ColorJitter(brightness=(0.9, 1.5)),  # Paper: brightness [0.9, 1.5]
-            transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),  # Paper: zoom 0.4
+            transforms.Resize((224, 224)),
+            transforms.RandomRotation(25),
+            transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), shear=15),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.ColorJitter(brightness=(0.9, 1.5)),
+            transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
             transforms.ToTensor(),
-            # COMMENT: Paper says "Normalization 0, 1" but doesn't specify mean/std.
-            # Using ImageNet stats since we use pretrained weights.
-            # IMPROVEMENT: Could compute dataset-specific mean/std.
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
     else:
@@ -189,7 +62,7 @@ def get_transforms(phase):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-#%% Fast Dataset using Pre-computed Segmented Images
+#%% Dataset
 class SkinCancerDataset(Dataset):
     def __init__(self, image_paths, labels, transform=None):
         self.image_paths = image_paths
@@ -200,25 +73,16 @@ class SkinCancerDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        # Load pre-segmented image (fast!)
-        original_path = Path(self.image_paths[idx])
-        segmented_path = SEGMENTED_DIR / original_path.name
-        
-        if segmented_path.exists():
-            img = Image.open(segmented_path).convert('RGB')
-        else:
-            img = Image.open(self.image_paths[idx]).convert('RGB')
-        
+        img = Image.open(self.image_paths[idx]).convert('RGB')
         label = self.labels[idx]
         if self.transform:
             img = self.transform(img)
         return img, label
 
-#%% ECA Module (Efficient Channel Attention) - Paper: "replaced with ECA"
+#%% ECA Module (Efficient Channel Attention)
 class ECAModule(nn.Module):
-    # Paper: "squeeze and excitation component was replaced with the practical channel attention (ECA)"
-    # COMMENT: Paper doesn't specify kernel size k. Using adaptive k based on channels.
-    # IMPROVEMENT: Could tune k as hyperparameter.
+    # Channel Attention is just like any attention method:
+    # It learns which channels are important for the specific image and amplifies them.
     def __init__(self, channels, gamma=2, b=1):
         super().__init__()
         t = int(abs((np.log2(channels) + b) / gamma))
@@ -245,11 +109,10 @@ def replace_se_with_eca(model):
                     block.se = ECAModule(in_channels)
     return model
 
-#%% Add Dilation to Late Stages - Paper: "dilated convolutions were incorporated"
+#%% Add Dilation to Late Stages
 def add_dilation(model):
-    # Paper: "dilated convolutions were incorporated into the model to enhance the receptive field"
-    # COMMENT: Paper doesn't specify which layers or dilation rate.
-    # IMPROVEMENT: Could experiment with different dilation rates and layers.
+    # Dilation essentially adds space inside the kernel. 
+    # For instance a 3x3 with dilation=2 becomes 5x5 using the same 9 weights.
     features = model.features
     for i in range(-3, 0):
         block = features[i]
@@ -260,7 +123,7 @@ def add_dilation(model):
                     layer.padding = (2, 2)
     return model
 
-#%% Improved MobileNet-V3 - Full implementation per paper
+#%% Improved MobileNet-V3
 class ImprovedMobileNetV3(nn.Module):
     def __init__(self, num_classes=7, dropout=0.1):
         super().__init__()
@@ -270,8 +133,8 @@ class ImprovedMobileNetV3(nn.Module):
         in_features = self.backbone.classifier[0].in_features
         self.backbone.classifier = nn.Sequential(
             nn.Linear(in_features, 1280),
-            nn.Hardswish(),
-            nn.Dropout(p=dropout),  # Paper: 0.1
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
             nn.Linear(1280, num_classes)
         )
     
@@ -284,6 +147,8 @@ class ImprovedMobileNetV3(nn.Module):
 #%% Grad-CAM for Interpretability
 class GradCAM:
     def __init__(self, model, target_layer):
+        # We register hooks to intercept values during forward and backward passes.
+        # This gives information as to *where* the model "looks".
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
@@ -386,7 +251,7 @@ def validate(model, loader, criterion):
     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
     return running_loss / len(loader), acc, precision, recall, f1, all_preds, all_labels
 
-#%% Main Training Pipeline - EXACTLY as paper specifies
+#%% Main training pipeline
 def main():
     metadata_path = DATA_DIR / "HAM10000_metadata.csv"
     image_dirs = [DATA_DIR / "HAM10000_images_part_1", DATA_DIR / "HAM10000_images_part_2"]
@@ -415,12 +280,12 @@ def main():
     print(f"Total samples: {len(image_paths)}")
     print(f"Class distribution: {Counter(labels)}")
     
-    # PRE-COMPUTE SEGMENTATION (one-time, saves ~5-10x training time)
-    precompute_segmentation(image_paths)
     
-    # COMMENT: Paper uses 70/15/15 split but doesn't mention patient-level splitting.
+    # Paper uses 70/15/15 split but doesn't mention patient-level splitting.
+    # My guess is they're leaking here, but ofc hard to know, since...
+    # They didn't publish their code :)
     # HAM10000 has multiple images per lesion - proper split should be by lesion_id.
-    # IMPROVEMENT: This prevents data leakage where same lesion appears in train and test.
+    # Basically we're doing it good now (I think): This prevents data leakage where same lesion appears in train and test.
     unique_lesions = list(set(lesion_ids))
     lesion_to_indices = {}
     for idx, lid in enumerate(lesion_ids):
@@ -428,7 +293,7 @@ def main():
             lesion_to_indices[lid] = []
         lesion_to_indices[lid].append(idx)
     
-    # Paper: 70% train, 15% val, 15% test
+    # 70% train, 15% val, 15% test
     train_lesions, temp_lesions = train_test_split(unique_lesions, test_size=0.30, random_state=42)
     val_lesions, test_lesions = train_test_split(temp_lesions, test_size=0.50, random_state=42)
     
@@ -446,21 +311,19 @@ def main():
     print(f"Train: {len(train_paths)}, Val: {len(val_paths)}, Test: {len(test_paths)}")
     print(f"Train class distribution: {Counter(train_labels)}")
     
-    # Paper: "data augmentation to balance the dataset"
+    # Weighted sampling for class balance
+    # Perhaps the paper also does this for the validation and testing data sets?
+    # That would also explain their super good results. But we won't know...
     class_counts = Counter(train_labels)
     class_weights = {c: 1.0 / count for c, count in class_counts.items()}
     sample_weights = [class_weights[label] for label in train_labels]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
     
-    # Create datasets (now using pre-segmented images - FAST!)
+    # Create datasets
     train_dataset = SkinCancerDataset(train_paths, train_labels, get_transforms('train'))
     val_dataset = SkinCancerDataset(val_paths, val_labels, get_transforms('val'))
     test_dataset = SkinCancerDataset(test_paths, test_labels, get_transforms('test'))
     
-    # Paper Table 4: Batch size = 8
-    # COMMENT: Paper uses 8, but this is unusually small - likely hardware constraint.
-    # IMPROVEMENT: Using 32 for T4 GPU (16GB VRAM) - better GPU utilization, ~4x faster.
-    # With linear scaling rule, we also bump LR from 1e-4 to 3e-4.
     BATCH_SIZE = 32
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
@@ -468,26 +331,12 @@ def main():
     
     model = ImprovedMobileNetV3(num_classes=7, dropout=0.1).to(device)
     criterion = nn.CrossEntropyLoss()
-    
-    # COMMENT: Paper specifies LR=0.2 and weight_decay=1.2 which are EXTREMELY unusual values.
-    # LR=0.2 with Adam typically causes divergence. Weight_decay=1.2 would zero out all weights.
-    # These are almost certainly typos in the paper.
-    # IMPROVEMENT: Using 3e-4 (scaled for batch_size=32 from 1e-4 at batch_size=8).
-    
-    # PAPER VALUES (commented out - will cause training failure):
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.2, weight_decay=1.2)
-    
-    # ACTUAL WORKING VALUES (LR scaled for larger batch):
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
-    
-    # COMMENT: Paper doesn't mention learning rate scheduler.
-    # IMPROVEMENT: Adding scheduler improves convergence.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
     
     best_val_acc = 0.0
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     
-    # Paper Table 4: Epochs = 100
     for epoch in range(100):
         print(f"\nEpoch {epoch+1}/100")
         
@@ -507,14 +356,14 @@ def main():
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_model_paper.pth')
+            torch.save(model.state_dict(), 'best_model.pth')
             print("Saved best model!")
     
-    model.load_state_dict(torch.load('best_model_paper.pth', weights_only=True))
+    model.load_state_dict(torch.load('best_model.pth', weights_only=True))
     test_loss, test_acc, test_prec, test_rec, test_f1, preds, labels_list = validate(model, test_loader, criterion)
     
     print("\n" + "="*50)
-    print("FINAL TEST RESULTS (Paper Implementation)")
+    print("FINAL TEST RESULTS")
     print("="*50)
     print(f"Accuracy: {test_acc:.4f}")
     print(f"Precision: {test_prec:.4f}")
@@ -533,33 +382,108 @@ def main():
     axes[1].set_title('Accuracy')
     axes[1].legend()
     plt.tight_layout()
-    plt.savefig('training_curves_paper.png')
+    plt.savefig('training_curves.png')
     plt.show()
     
     return model, test_dataset
 
-#%% Run Training
+#%% Run Training (just comment out if you just want evaluation)
 if __name__ == '__main__':
     model, test_dataset = main()
 
-#%% Grad-CAM Visualization
-def run_gradcam():
-    model = ImprovedMobileNetV3(num_classes=7, dropout=0.1).to(device)
-    model.load_state_dict(torch.load('best_model_paper.pth', map_location=device, weights_only=True))
-    model.eval()
+#%% EVALUATION ONLY - Load saved model and generate report results
+def evaluate_saved_model():
+    """Load best_model.pth and generate all results needed for a report."""
+    from sklearn.metrics import confusion_matrix
+    import seaborn as sns
     
-    metadata = pd.read_csv(DATA_DIR / "HAM10000_metadata.csv")
+    metadata_path = DATA_DIR / "HAM10000_metadata.csv"
     image_dirs = [DATA_DIR / "HAM10000_images_part_1", DATA_DIR / "HAM10000_images_part_2"]
+    metadata = pd.read_csv(metadata_path)
+    label_map = {c: i for i, c in enumerate(CLASSES)}
     
+    image_paths, labels, lesion_ids = [], [], []
+    for _, row in metadata.iterrows():
+        img_name = row['image_id'] + '.jpg'
+        for img_dir in image_dirs:
+            img_path = img_dir / img_name
+            if img_path.exists():
+                image_paths.append(str(img_path))
+                labels.append(label_map[row['dx']])
+                lesion_ids.append(row['lesion_id'])
+                break
+    
+    unique_lesions = list(set(lesion_ids))
+    lesion_to_indices = {lid: [] for lid in unique_lesions}
+    for idx, lid in enumerate(lesion_ids):
+        lesion_to_indices[lid].append(idx)
+    
+    train_lesions, temp_lesions = train_test_split(unique_lesions, test_size=0.30, random_state=42)
+    val_lesions, test_lesions = train_test_split(temp_lesions, test_size=0.50, random_state=42)
+    
+    test_indices = [idx for lid in test_lesions for idx in lesion_to_indices[lid]]
+    test_paths = [image_paths[i] for i in test_indices]
+    test_labels = [labels[i] for i in test_indices]
+    
+    test_dataset = SkinCancerDataset(test_paths, test_labels, get_transforms('test'))
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
+    
+    model = ImprovedMobileNetV3(num_classes=7, dropout=0.1).to(device)
+    model.load_state_dict(torch.load('best_model.pth', map_location=device, weights_only=True))
+    model.eval()
+    print("Model loaded successfully!")
+    
+    criterion = nn.CrossEntropyLoss()
+    test_loss, test_acc, test_prec, test_rec, test_f1, preds, true_labels = validate(model, test_loader, criterion)
+    
+    print(f"Test Samples: {len(test_labels)}")
+    print(f"Accuracy:  {test_acc:.4f} ({test_acc*100:.2f}%)")
+    print(f"Precision: {test_prec:.4f}")
+    print(f"Recall:    {test_rec:.4f}")
+    print(f"F1-Score:  {test_f1:.4f}")
+    
+    print(classification_report(true_labels, preds, target_names=CLASS_NAMES, zero_division=0))
+    
+    cm = confusion_matrix(true_labels, preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png', dpi=150)
+    plt.show()
+    print("Saved: confusion_matrix.png")
+    
+    # Grad-CAM for each class
+    print("\n" + "="*60)
+    print("GENERATING GRAD-CAM VISUALIZATIONS")
+    print("="*60)
     for i, class_name in enumerate(CLASSES):
         sample = metadata[metadata['dx'] == class_name].iloc[0]
         img_name = sample['image_id'] + '.jpg'
         for img_dir in image_dirs:
             img_path = img_dir / img_name
             if img_path.exists():
-                print(f"Running Grad-CAM for {CLASS_NAMES[i]} ({class_name})")
-                visualize_gradcam(model, str(img_path), get_transforms('test'), f'gradcam_{class_name}_paper.png')
+                print(f"  {CLASS_NAMES[i]}...")
+                visualize_gradcam(model, str(img_path), get_transforms('test'), f'gradcam_images/gradcam_{class_name}.png')
                 break
+    
 
+    print(f"""
+Results on HAM10000 Test Set (n={len(test_labels)}):
+- Overall Accuracy: {test_acc*100:.2f}%
+- Weighted Precision: {test_prec*100:.2f}%
+- Weighted Recall: {test_rec*100:.2f}%
+- Weighted F1-Score: {test_f1*100:.2f}%
+
+""")
+    
+    return model, test_acc, test_prec, test_rec, test_f1
+
+#%% Run this for evaluation
 if __name__ == '__main__':
-    run_gradcam()
+    model, acc, prec, rec, f1 = evaluate_saved_model()

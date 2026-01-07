@@ -33,7 +33,8 @@ print("Downloading HAM10000 dataset via kagglehub...")
 DATA_DIR = Path(kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000"))
 print(f"Dataset path: {DATA_DIR}")
 
-SEGMENTED_DIR = DATA_DIR / "segmented_images"
+# Use writable directory for segmented images (Kaggle cache is read-only on Colab)
+SEGMENTED_DIR = Path("./segmented_images")
 
 #%% U-Net Architecture for Segmentation (Paper: "Hybrid U-Net and Improved MobileNet-V3")
 class DoubleConv(nn.Module):

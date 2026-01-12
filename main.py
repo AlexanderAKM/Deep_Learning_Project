@@ -41,26 +41,54 @@ print("Downloading HAM10000 dataset via kagglehub...")
 DATA_DIR = Path(kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000"))
 print(f"Dataset path: {DATA_DIR}")
 
-#%% Transforms - as specified in paper Table 4
+#%% Transforms - as specified in paper Table 2 and Table 4
+# Note: The paper does not specify tile_grid_size of CLAHE, so I picked (8,8) as a common choice.
+# TODO: CLAHE might not work yet - verify this!
+# Could be possible that resizing to (192,256) contradicts the pre-training of MobileNetV3,
+
 def get_transforms(phase):
     if phase == 'train':
         return transforms.Compose([
             transforms.Resize((224, 224)),
+            CLAHETransform(clip_limit=4.0, tile_grid_size=(8, 8)),
             transforms.RandomRotation(25),
             transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), shear=15),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.ColorJitter(brightness=(0.9, 1.5)),
+            transforms.ColorJitter(brightness=(0.8, 1.5)),
             transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            transforms.Resize((192, 256)),
+            transforms.ToTensor()
         ])
     else:
         return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            CLAHETransform(clip_limit=4.0, tile_grid_size=(8, 8)),
+            transforms.Resize((192, 256)),
+            transforms.ToTensor()
         ])
+    
+class CLAHETransform:
+    def __init__(self, clip_limit=4.0, tile_grid_size=(8, 8)):
+        self.clahe = cv2.createCLAHE(
+            clipLimit=clip_limit,
+            tileGridSize=tile_grid_size
+        )
+    def __call__(self, img):
+        # img is a PIL image
+        img = np.array(img)
+
+        # Convert RGB → LAB
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+
+        # Apply CLAHE to L (luminance) channel
+        l = self.clahe.apply(l)
+
+        # Convert back to RGB
+        lab = cv2.merge((l, a, b))
+        img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+        return Image.fromarray(img)
 
 #%% Dataset
 class SkinCancerDataset(Dataset):
@@ -134,6 +162,7 @@ class ImprovedMobileNetV3(nn.Module):
         self.backbone.classifier = nn.Sequential(
             nn.Linear(in_features, 1280),
             nn.ReLU(),
+            # TODO: add layer normalization? no batch norm because  mobilenetv3 already uses it
             nn.Dropout(p=dropout),
             nn.Linear(1280, num_classes)
         )
@@ -145,6 +174,7 @@ class ImprovedMobileNetV3(nn.Module):
         return self.backbone.features
 
 #%% Grad-CAM for Interpretability
+# TODO: grad-cams all look very similar - verify correctness! perhaps use package by jacobgil
 class GradCAM:
     def __init__(self, model, target_layer):
         # We register hooks to intercept values during forward and backward passes.
@@ -325,6 +355,7 @@ def main():
     test_dataset = SkinCancerDataset(test_paths, test_labels, get_transforms('test'))
     
     BATCH_SIZE = 32
+    # TODO: batch size 8 is used in the paper.
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
@@ -333,6 +364,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+    # TODO: remove scheduler? Not mentioned in paper.
     
     best_val_acc = 0.0
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}

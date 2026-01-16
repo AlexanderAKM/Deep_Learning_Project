@@ -395,8 +395,8 @@ def main():
     return model, test_dataset
 
 #%% Run Training (just comment out if you just want evaluation)
-if __name__ == '__main__':
-    model, test_dataset = main()
+# if __name__ == '__main__':
+#     model, test_dataset = main()
 
 #%% EVALUATION ONLY - Load saved model and generate report results
 def evaluate_saved_model():

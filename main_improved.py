@@ -408,8 +408,8 @@ def main():
     return model, test_dataset
 
 #%% Run Training (just comment out if you just want evaluation)
-if __name__ == '__main__':
-    model, test_dataset = main()
+# if __name__ == '__main__':
+#     model, test_dataset = main()
 
 #%% EVALUATION ONLY - Load saved model and generate report results
 def evaluate_saved_model():
@@ -478,12 +478,19 @@ def evaluate_saved_model():
     plt.show()
     print("Saved: confusion_matrix_improved.png")
     
-    # Grad-CAM for each class
+    # Grad-CAM for all classes in a single figure
     print("\n" + "="*60)
     print("GENERATING GRAD-CAM VISUALIZATIONS")
     print("="*60)
     save_dir = 'gradcam_images_improved'
     os.makedirs(save_dir, exist_ok=True)
+    
+    model.eval()
+    target_layer = model.backbone.features[-1]
+    gradcam = GradCAM(model, target_layer)
+    
+    fig, axes = plt.subplots(7, 3, figsize=(15, 28))
+    
     for i, class_name in enumerate(CLASSES):
         sample = metadata[metadata['dx'] == class_name].iloc[0]
         img_name = sample['image_id'] + '.jpg'
@@ -491,8 +498,33 @@ def evaluate_saved_model():
             img_path = img_dir / img_name
             if img_path.exists():
                 print(f"  {CLASS_NAMES[i]}...")
-                visualize_gradcam(model, str(img_path), get_transforms('test'), f'{save_dir}/gradcam_improved_{class_name}.png')
+                img = Image.open(str(img_path)).convert('RGB')
+                input_tensor = get_transforms('test')(img).unsqueeze(0).to(device)
+                cam, pred_class = gradcam.generate_cam(input_tensor)
+                
+                img_resized = img.resize((256, 192))
+                img_array = np.array(img_resized) / 255.0
+                heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+                heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+                overlay = 0.5 * img_array + 0.5 * heatmap
+                
+                axes[i, 0].imshow(img_array)
+                axes[i, 0].set_title(f'{CLASS_NAMES[i]} - Original', fontsize=15, fontweight='bold')
+                axes[i, 0].axis('off')
+                
+                axes[i, 1].imshow(cam, cmap='jet')
+                axes[i, 1].set_title(f'{CLASS_NAMES[i]} - Grad-CAM', fontsize=15, fontweight='bold')
+                axes[i, 1].axis('off')
+                
+                axes[i, 2].imshow(overlay)
+                axes[i, 2].set_title(f'{CLASS_NAMES[i]} - Overlay (Pred: {CLASS_NAMES[pred_class]})', fontsize=15, fontweight='bold')
+                axes[i, 2].axis('off')
                 break
+    
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/gradcam_all_classes.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"Saved: {save_dir}/gradcam_all_classes.png")
     
 
     print(f"""

@@ -337,8 +337,8 @@ def main():
     
     model = ImprovedMobileNetV3(num_classes=7, dropout=0.1).to(device)
     criterion = nn.CrossEntropyLoss()
-    # Use learning rate 0.1 as per MobileNetV3 paper, with decay of 0.01 every 3 epochs
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.1, weight_decay=1e-5)
+    # Use learning rate 0.2 as per MobileNetV3 paper, with decay of 0.01 every 3 epochs
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.2, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.01)
     
     best_val_acc = 0.0
